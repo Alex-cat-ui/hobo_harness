@@ -1,0 +1,142 @@
+{
+  "name": "Full Development",
+  "graph": {
+    "nodes": [
+      {
+        "id": "in",
+        "kind": "input"
+      },
+      {
+        "id": "read",
+        "kind": "tool",
+        "output": "00_context.md",
+        "command": [
+          "bash",
+          "-lc",
+          "for f in src/*.py tests/*.py; do echo \"===== $f\"; cat \"$f\"; done"
+        ]
+      },
+      {
+        "id": "analyst",
+        "kind": "agent",
+        "role": "analyst",
+        "slot": "reasoning",
+        "output": "01_requirements.md"
+      },
+      {
+        "id": "arch",
+        "kind": "agent",
+        "role": "architect",
+        "slot": "reasoning",
+        "output": "02_plan.md"
+      },
+      {
+        "id": "coder",
+        "kind": "agent",
+        "role": "coder",
+        "slot": "reasoning",
+        "output": "03_changes.md",
+        "gate": true
+      },
+      {
+        "id": "review",
+        "kind": "agent",
+        "role": "reviewer",
+        "slot": "coding",
+        "output": "05_findings.md"
+      },
+      {
+        "id": "out",
+        "kind": "output"
+      }
+    ],
+    "edges": [
+      {
+        "from": "in",
+        "to": "read"
+      },
+      {
+        "from": "read",
+        "to": "analyst"
+      },
+      {
+        "from": "analyst",
+        "to": "arch"
+      },
+      {
+        "from": "arch",
+        "to": "coder"
+      },
+      {
+        "from": "review",
+        "to": "out"
+      },
+      {
+        "from": "coder",
+        "to": "review"
+      }
+    ]
+  },
+  "roles": {
+    "analyst": {
+      "name": "analyst",
+      "slot": "reasoning",
+      "window": 16384,
+      "temperature": 0.5,
+      "artifact": "Requirements",
+      "primary_inputs": [
+        "00_task.md",
+        "00_context.md"
+      ],
+      "system": "You are the analyst in a development pipeline. Your only job is to turn a vague task into verifiable requirements. You do NOT design the solution and you do NOT write code.\n\nThe document body must contain, in this order:\n- Statement: what is required, one paragraph.\n- Requirements: a numbered list of verifiable claims.\n- Out of scope: what must NOT be done. At least three items.\n- Areas touched: files the change will reach.\n- Unknowns: questions the statement does not answer, or the word none.\n\nRules:\n- Do not propose an implementation.\n- Do not widen the task.\n- Do not invent answers on the user's behalf.",
+      "skill": "find-requirements"
+    },
+    "architect": {
+      "name": "architect",
+      "slot": "reasoning",
+      "window": 16384,
+      "temperature": 0.4,
+      "artifact": "Plan",
+      "primary_inputs": [
+        "00_task.md",
+        "01_requirements.md",
+        "00_context.md"
+      ],
+      "system": "You are the architect. You turn requirements into a plan of changes. You do NOT write code.\n\nThe document body must contain:\n- Approach: the chosen solution in one paragraph and why this one.\n- Rejected alternatives: at least one, with the reason.\n- Steps: an ordered list. For each: file, substance of the edit, why.\n- Invariants: what must remain unchanged.\n- Risks: what could break and how it would be noticed.\n\nSet results.verdict to ok, or to too_large if the work cannot be one coherent change.\n\nRules:\n- One decision, not a menu.\n- Do not add dependencies. The project uses the standard library only.\n- Do not design for the future.",
+      "skill": "plan-change"
+    },
+    "coder": {
+      "name": "coder",
+      "slot": "reasoning",
+      "window": 16384,
+      "temperature": 0.15,
+      "artifact": "Patch",
+      "primary_inputs": [
+        "00_task.md",
+        "02_plan.md",
+        "00_context.md"
+      ],
+      "system": "You are the coder. You carry out a finished plan by changing files, running the tests, and fixing what breaks. You work in steps.\n\nWhen the tests pass, and only then, write your document. Its body must say, in plain sentences:\n- which files you changed and what you changed in each\n- the result of the last test run\n- anything the plan asked for that you did not do, and why",
+      "skill": "change-code",
+      "tools": true,
+      "max_steps": 14,
+      "must_write": true
+    },
+    "reviewer": {
+      "name": "reviewer",
+      "slot": "coding",
+      "window": 16384,
+      "temperature": 0.2,
+      "artifact": "Findings",
+      "primary_inputs": [
+        "00_task.md",
+        "01_requirements.md",
+        "03_changes.md"
+      ],
+      "system": "You review a change that has already been applied and tested. You look for what is broken or has diverged from the plan. You do NOT rewrite code.\n\nFor each finding give: file and location, the defect in one sentence, a failure scenario naming concrete inputs or state, and a severity of breaking, risky or minor.\n\nRules:\n- Without a failure scenario it is not a finding.\n- Style preferences are not findings.\n- If there are no defects, say so. An empty list is acceptable.",
+      "skill": "review-change",
+      "tools": true,
+      "max_steps": 8
+    }
+  }
+}

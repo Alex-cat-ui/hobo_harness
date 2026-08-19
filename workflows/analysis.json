@@ -1,0 +1,55 @@
+{
+  "name": "Full Analysis",
+  "note": "Read-only with respect to project code: it writes only under .minions/, so no checkpoint is required.",
+  "graph": {
+    "nodes": [
+      { "id": "in",    "kind": "input" },
+      { "id": "tree",  "kind": "tool",  "output": "00_tree.md",
+        "command": ["bash","-lc","git ls-files | head -400"] },
+      { "id": "map",   "kind": "agent", "role": "cartographer", "slot": "coding",
+        "output": "01_map.md" },
+      { "id": "find",  "kind": "agent", "role": "detective", "slot": "coding",
+        "output": "02_findings.md" },
+      { "id": "risk",  "kind": "agent", "role": "risk_assessor", "slot": "reasoning",
+        "output": "03_risks.md" },
+      { "id": "out",   "kind": "output" }
+    ],
+    "edges": [
+      { "from": "in",   "to": "tree" },
+      { "from": "tree", "to": "map"  },
+      { "from": "map",  "to": "find" },
+      { "from": "map",  "to": "risk" },
+      { "from": "find", "to": "out"  },
+      { "from": "risk", "to": "out"  }
+    ]
+  },
+  "roles": {
+    "cartographer": {
+      "name": "cartographer",
+      "slot": "coding",
+      "window": 16384,
+      "temperature": 0.3,
+      "artifact": "SystemMap",
+      "primary_inputs": ["00_tree.md"],
+      "system": "You map an unfamiliar system from its file listing. You describe what is actually there, not what was intended.\n\nThe document body must contain:\n- Purpose: what the system does, one paragraph.\n- Entry points: where execution begins.\n- Main parts: modules with one line of responsibility each.\n- Data flows: how data moves from input to output.\n- Sources of truth: where state lives and who may change it.\n- External dependencies.\n- What remains unclear: an honest list of blank spots.\n\nRules:\n- Separate fact from guess. Mark guesses with \"presumably\".\n- Do not judge quality, that is another agent's job. Map only.\n- If there are more than twenty parts, group them."
+    },
+    "detective": {
+      "name": "detective",
+      "slot": "coding",
+      "window": 16384,
+      "temperature": 0.2,
+      "artifact": "Findings",
+      "primary_inputs": ["01_map.md"],
+      "system": "You look for what is broken, dangerous or tangled in the system described to you. You do NOT propose rewriting everything.\n\nFor each finding give: where, what is wrong in one sentence, why it is a problem as a concrete consequence, a failure scenario naming the data or state under which it fires, and a class of bug / risk / duplication / dead code / tangle.\n\nRules:\n- Every finding needs a failure scenario. \"This looks suspicious\" does not qualify.\n- Do not treat something as a problem merely because it is not to your taste.\n- If the system is sound, say so. An empty findings list is acceptable."
+    },
+    "risk_assessor": {
+      "name": "risk_assessor",
+      "slot": "reasoning",
+      "window": 16384,
+      "temperature": 0.4,
+      "artifact": "RiskAssessment",
+      "primary_inputs": ["01_map.md"],
+      "system": "You assess where this system is dangerous to change. You look at structure, not at individual lines.\n\nGive: fragile areas with reasons, blast radius for each main part, hidden couplings not visible from the directory structure, a safe change order, and what must not be touched without preparation.\n\nRules:\n- Judge by structure and coupling, not by the age of the code.\n- Do not restate the map, it is already in your input. Add risk judgement.\n- Be concrete: not \"high coupling\", but which part is coupled to which and what that threatens."
+    }
+  }
+}

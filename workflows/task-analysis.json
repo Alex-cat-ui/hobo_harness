@@ -1,0 +1,37 @@
+{
+  "name": "Task Analysis",
+  "note": "Pure reasoning. No repository, no files, no tools — the subject is a question, not a codebase.",
+  "graph": {
+    "nodes": [
+      { "id": "in",    "kind": "input" },
+      { "id": "scope", "kind": "agent", "role": "scoper",   "slot": "reasoning", "output": "01_scope.md" },
+      { "id": "approach", "kind": "agent", "role": "approacher", "slot": "reasoning", "output": "02_approach.md" },
+      { "id": "risks", "kind": "agent", "role": "risk_assessor", "slot": "reasoning", "output": "03_risks.md" },
+      { "id": "out",   "kind": "output" }
+    ],
+    "edges": [
+      { "from": "in",       "to": "scope" },
+      { "from": "scope",    "to": "approach" },
+      { "from": "approach", "to": "risks" },
+      { "from": "risks",    "to": "out" }
+    ]
+  },
+  "roles": {
+    "scoper": {
+      "name": "scoper", "slot": "reasoning", "window": 16384, "temperature": 0.4,
+      "artifact": "Requirements", "primary_inputs": ["00_task.md"],
+      "skill": "scope-a-question", "clarifies": true,
+      "system": "You work out what a question is really asking before anyone tries to answer it. You have no files and no tools.\n\nThe document body must contain, in this order:\n- Statement: what you believe is being asked, one sentence.\n- Requirements: numbered, what must be true for an answer to be useful.\n- Out of scope: at least three things.\n- Unknowns: every open choice that would change the answer, one per line. Write none only if there are truly none."
+    },
+    "approacher": {
+      "name": "approacher", "slot": "reasoning", "window": 16384, "temperature": 0.4,
+      "artifact": "Plan", "primary_inputs": ["01_scope.md", "00_task.md"],
+      "system": "You lay out how one would go about answering the question that has been scoped. You are not answering it yet and you write no code.\n\nThe document body must contain:\n- Approach: the route you would take, one paragraph, and why this one.\n- Rejected alternatives: at least one, with the reason.\n- Steps: an ordered list. For each, what is done and what it produces.\n- What would settle it: the evidence or measurement that would make the answer defensible rather than plausible.\n\nSet results.verdict to ok, or too_large if this cannot be one coherent piece of work.\n\nRules:\n- One route, not a menu.\n- Say plainly where you are reasoning from general knowledge rather than from something specific to this case."
+    },
+    "risk_assessor": {
+      "name": "risk_assessor", "slot": "reasoning", "window": 16384, "temperature": 0.4,
+      "artifact": "RiskAssessment", "primary_inputs": ["02_approach.md", "01_scope.md"],
+      "system": "You say where this approach is most likely to go wrong.\n\nThe document body must contain:\n- Fragile areas: the parts of the approach most likely to fail, with why.\n- Blast radius: what else is affected when each fails.\n- Hidden couplings: dependencies not obvious from the plan.\n- Safe order: what to do first so that a failure costs least.\n- What must not be attempted without preparation, and what preparation.\n\nRules:\n- Be concrete. Not 'this is complex', but which part and what goes wrong.\n- Do not restate the approach. Add judgement about risk."
+    }
+  }
+}

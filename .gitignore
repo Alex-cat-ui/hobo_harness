@@ -1,0 +1,7 @@
+.DS_Store
+.minions/
+node_modules/
+target/
+dist/
+.build/
+mutants.out*/

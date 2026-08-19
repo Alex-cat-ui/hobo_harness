@@ -1,0 +1,11 @@
+[package]
+name = "minions-probe"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+minions-core = { path = "../minions-core" }
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
