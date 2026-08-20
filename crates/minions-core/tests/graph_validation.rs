@@ -6,7 +6,7 @@ use proptest::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 
 fn n(id: &str, kind: NodeKind) -> Node {
-    Node { id: id.into(), kind, role: None, slot: None, output: None, loop_limit: None, command: None, gate: false }
+    Node { id: id.into(), kind, role: None, slot: None, output: None, loop_limit: None, command: None, artifact: None, requires_success: false, gate: false }
 }
 fn agent(id: &str) -> Node {
     Node {
@@ -17,6 +17,8 @@ fn agent(id: &str) -> Node {
         output: Some(format!("{id}.md")),
         loop_limit: None,
         command: None,
+        artifact: None,
+        requires_success: false,
         gate: false,
     }
 }
@@ -129,7 +131,7 @@ fn a_cycle_without_a_loop_node_is_refused_and_with_one_is_accepted() {
 #[test]
 fn an_agent_without_a_slot_or_an_output_is_named() {
     let mut g = linear();
-    g.nodes.push(Node { id: "bare".into(), kind: NodeKind::Agent, role: None, slot: None, output: None, loop_limit: None, command: None, gate: false });
+    g.nodes.push(Node { id: "bare".into(), kind: NodeKind::Agent, role: None, slot: None, output: None, loop_limit: None, command: None, artifact: None, requires_success: false, gate: false });
     g.edges.push(e("a", "bare"));
     g.edges.push(e("bare", "out"));
     let errs = g.validate();
@@ -217,6 +219,68 @@ fn is_valid_agrees_with_validate() {
     let mut broken = linear();
     broken.nodes.push(agent("orphan"));
     assert!(!broken.is_valid(), "a broken graph must not report valid");
+}
+
+/// A command produces output, not judgement. It can fill a `TestReport`, whose
+/// numbers the harness parses itself, or a document type that demands no
+/// numbers — anything else would need a model behind it.
+#[test]
+fn a_tool_node_may_only_promise_a_document_a_command_can_write() {
+    let mut g = Graph {
+        nodes: vec![n("in", NodeKind::Input), n("t", NodeKind::Tool), n("out", NodeKind::Output)],
+        edges: vec![
+            Edge { from: "in".into(), to: "t".into(), when: None },
+            Edge { from: "t".into(), to: "out".into(), when: None },
+        ],
+    };
+    let t = g.nodes.iter_mut().find(|x| x.id == "t").unwrap();
+    t.output = Some("00_context.md".into());
+    t.command = Some(vec!["bash".into(), "-lc".into(), "ls".into()]);
+
+    // No declaration: a test report, as it always was.
+    assert_eq!(g.validate(), vec![]);
+
+    for (artifact, why) in [
+        ("Wishlist", "declares an artifact type that does not exist"),
+        ("Findings", "declares an artifact whose results a command cannot produce"),
+    ] {
+        g.nodes.iter_mut().find(|x| x.id == "t").unwrap().artifact = Some(artifact.into());
+        assert_eq!(
+            g.validate(),
+            vec![GraphError::InvalidNode { id: "t".into(), why }],
+            "`{artifact}` should not be allowed on a tool node"
+        );
+    }
+
+    // A `Report` requires no results, so a command can write one.
+    g.nodes.iter_mut().find(|x| x.id == "t").unwrap().artifact = Some("Report".into());
+    assert_eq!(g.validate(), vec![]);
+}
+
+/// The workflows shipped in this repository are what `mrun` runs. A graph that
+/// does not validate is a run that will not start, and that must be caught by
+/// the suite rather than by a person at the terminal.
+#[test]
+fn every_workflow_in_the_repository_validates() {
+    #[derive(serde::Deserialize)]
+    struct Workflow {
+        name: String,
+        graph: Graph,
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).expect("the workflows directory").flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let wf: Workflow =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+        assert_eq!(wf.graph.validate(), vec![], "workflow `{}` does not validate", wf.name);
+        seen += 1;
+    }
+    assert!(seen >= 3, "only {seen} workflows were checked");
 }
 
 proptest! {

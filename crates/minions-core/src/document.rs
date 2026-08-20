@@ -85,12 +85,60 @@ impl Artifact {
             TestSurface => &["public_units", "covered", "uncovered", "untestable"],
             TestPlan => &["tests", "mandatory"],
             TestSuite => &["tests_written", "files"],
-            TestReport => &["total", "passed", "failed", "baseline_total", "baseline_passed"],
+            // A report says first whether it measured anything. The numbers
+            // are required only when it did — writing zeros for a command that
+            // ran no tests is how "nothing was measured" read as "all green"
+            // (finding 26); see the extra check in `parse`.
+            TestReport => &["conclusive"],
             Triage => &["failures", "test_at_fault", "code_at_fault"],
             ForemanLog => &["calls", "budget_used", "complete"],
             Report => &[],
         }
     }
+
+    /// Sections the body must carry — for the artifacts whose role prompt names
+    /// them as a list, and only those. The check is over prose, so it is worth
+    /// exactly as much as what the prompt teaches: `RiskAssessment` is
+    /// deliberately absent, because its role asks for prose and one of the four
+    /// such documents produced so far is sound prose without a single heading.
+    /// Rejecting it would be the harness punishing a model for obeying the
+    /// prompt it was handed. `TestPlan` is absent for a simpler reason: no role
+    /// produces one yet.
+    ///
+    /// Measured before it was written: the rule was run over all 30 documents
+    /// of every run on disk, and the only rejection was that RiskAssessment.
+    pub fn required_sections(&self) -> &'static [&'static str] {
+        use Artifact::*;
+        match self {
+            Requirements => &["Statement", "Requirements", "Out of scope"],
+            Plan => &["Approach", "Rejected alternatives", "Steps"],
+            SystemMap => &["Purpose", "Entry points", "Main parts", "Data flows"],
+            _ => &[],
+        }
+    }
+}
+
+/// The body with a wrapping code fence taken off, if it has one. Models fence
+/// JSON out of habit, and a fence must not hide what it wraps.
+fn unfenced(body: &str) -> &str {
+    let t = body.trim();
+    let Some(rest) = t.strip_prefix("```") else { return t };
+    let rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
+    rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
+}
+
+/// Whether the body opens a section with this name. Deliberately lenient: the
+/// name may be a heading, a list item, bold, or a bare line, in any case. A
+/// document is rejected for missing a section, never for how it dressed one —
+/// a stricter rule would burn attempts on punctuation.
+fn body_has_section(body: &str, name: &str) -> bool {
+    let wanted = name.to_ascii_lowercase();
+    body.lines().any(|line| {
+        line.trim()
+            .trim_start_matches(['#', '-', '*', '>', ' '])
+            .to_ascii_lowercase()
+            .starts_with(&wanted)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +172,8 @@ pub enum DocError {
     EmptyDigest,
     DigestTooLong { tokens: usize, limit: usize },
     MissingResultsKey { artifact: &'static str, key: &'static str },
+    MissingSection { artifact: &'static str, name: &'static str },
+    BodyRestatesHeader,
     EmptyBody,
 }
 
@@ -141,6 +191,12 @@ impl fmt::Display for DocError {
             }
             DocError::MissingResultsKey { artifact, key } => {
                 write!(f, "a `{artifact}` document must carry `results.{key}`")
+            }
+            DocError::MissingSection { artifact, name } => {
+                write!(f, "the body of a `{artifact}` document must carry a `{name}` section")
+            }
+            DocError::BodyRestatesHeader => {
+                write!(f, "the body is the header said again as JSON, not a document body")
             }
             DocError::EmptyBody => write!(f, "the document has a header but no body"),
         }
@@ -165,6 +221,14 @@ impl DocError {
             DocError::MissingResultsKey { key, .. } => {
                 format!("Add `{key}:` under the `results:` block, with a numeric or single-word value.")
             }
+            DocError::MissingSection { name, .. } => format!(
+                "Write the missing part of the body: a line beginning with `{name}:` and then that section. \
+                 The body is prose in the structure the role described, not the header said twice."
+            ),
+            DocError::BodyRestatesHeader => "The body after the closing `---` is prose in the structure your role \
+                 described. Do not repeat the header there, and do not answer in JSON: the numbers already stand in \
+                 `results:`, and what belongs below is the substance behind them."
+                .to_string(),
             DocError::EmptyBody => "Write the document body after the closing `---`.".to_string(),
         };
         format!("The previous reply was rejected: {self}. {fix} Reply with the corrected document only.")
@@ -304,6 +368,36 @@ pub fn parse(text: &str, tok: &dyn Tokenizer) -> Result<Document, DocError> {
         return Err(DocError::EmptyBody);
     }
 
+    // A report that says it measured something must carry what it measured.
+    // The pair is the contract: `conclusive: no` and no numbers, or
+    // `conclusive: yes` and all three.
+    if artifact == Artifact::TestReport && results.get("conclusive").map(|s| s.as_str()) == Some("yes") {
+        for key in ["total", "passed", "failed"] {
+            if !results.contains_key(key) {
+                return Err(DocError::MissingResultsKey { artifact: artifact.name(), key });
+            }
+        }
+    }
+
+    // A body that restates the header is what a model produces when it has
+    // learned the shape of an answer and not the substance of one. It passed
+    // every check there was — the body was not empty and the header above it
+    // was perfect — and went into the report as "one breaking issue found":
+    // `05_findings.md` of the run 2026-08-16T18-41-51.
+    let naked = unfenced(&body);
+    if naked.starts_with('{') && naked.contains("\"digest\"") {
+        return Err(DocError::BodyRestatesHeader);
+    }
+
+    // Until now the above was the whole check on the body. The next node reads
+    // sections out of it, so a body that skips one is a document-shaped reply
+    // rather than a document (IMPROVEMENTS 1.3).
+    for name in artifact.required_sections() {
+        if !body_has_section(&body, name) {
+            return Err(DocError::MissingSection { artifact: artifact.name(), name });
+        }
+    }
+
     Ok(Document {
         header: Header {
             artifact,
@@ -377,6 +471,13 @@ digest: |
 ---
 
 Statement: the profile must change without a restart.
+
+Requirements:
+1. The active session survives the switch.
+2. The switch is atomic.
+
+Out of scope:
+- Changing the tunnel protocol.
 ";
 
     #[test]
@@ -410,6 +511,85 @@ Statement: the profile must change without a restart.
         let e = parse(&text, &tk()).unwrap_err();
         assert_eq!(e, DocError::MissingResultsKey { artifact: "Requirements", key: "unknowns" });
         assert!(e.guidance().contains("unknowns"));
+    }
+
+    /// The real body of `05_findings.md`, run 2026-08-16T18-41-51: the reviewer
+    /// answered with its own header as JSON, the harness accepted it, and
+    /// `results.breaking: 1` went into the report as a finding nobody had made.
+    #[test]
+    fn a_report_that_claims_a_measurement_must_carry_it() {
+        let head = "---\nartifact: TestReport\nrun: r\nnode: tests\nattempt: 1\nmodel: harness\ncreated: c\ninputs: []\nresults:\n";
+        let tail = "digest: |\n  Something ran.\n---\n\n$ python3 -m unittest\n\nRan 4 tests\n";
+
+        // Nothing measured: `conclusive` alone is the whole contract.
+        let nothing = format!("{head}  conclusive: no\n{tail}");
+        assert!(parse(&nothing, &tk()).is_ok(), "a report of nothing owes no numbers");
+
+        // Something measured, and the numbers left out: that is the shape a
+        // branch would read as zero.
+        let half = format!("{head}  conclusive: yes\n  total: 4\n  passed: 4\n{tail}");
+        assert_eq!(
+            parse(&half, &tk()).unwrap_err(),
+            DocError::MissingResultsKey { artifact: "TestReport", key: "failed" }
+        );
+
+        let whole = format!("{head}  conclusive: yes\n  total: 4\n  passed: 3\n  failed: 1\n{tail}");
+        assert!(parse(&whole, &tk()).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_body_that_is_the_header_said_again() {
+        let echo = "{\n  \"artifact\": \"Findings\",\n  \"run\": \"2026-08-16T18-41-51_full-development\",\n  \"node\": \"reviewer\",\n  \"attempt\": 1,\n  \"model\": \"qwen2.5-coder:14b\",\n  \"results\": {\n    \"breaking\": 1\n  },\n  \"digest\": \"One breaking issue found in src/durations.py.\"\n}";
+        let text = format!(
+            "---\nartifact: Findings\nrun: r\nnode: reviewer\nattempt: 1\nmodel: m\ncreated: c\ninputs: []\nresults:\n  breaking: 1\n  risky: 0\n  minor: 0\n  unmet_requirements: 0\ndigest: |\n  One breaking issue.\n---\n\n{echo}\n"
+        );
+        let e = parse(&text, &tk()).unwrap_err();
+        assert_eq!(e, DocError::BodyRestatesHeader);
+        assert!(e.guidance().contains("prose"), "{}", e.guidance());
+
+        // Fenced, which is how the same model writes it half the time.
+        let fenced = text.replace(echo, &format!("```json\n{echo}\n```"));
+        assert_eq!(parse(&fenced, &tk()).unwrap_err(), DocError::BodyRestatesHeader);
+    }
+
+    #[test]
+    fn a_body_that_merely_contains_json_is_not_an_echo() {
+        // Quoting a payload is legitimate: the rule is about a body that *is*
+        // the header, not about the character `{`.
+        let body = "The failure fires on this input:\n\n```json\n{\"digest\": \"x\"}\n```\n\nThe parser then returns None.";
+        let text = format!(
+            "---\nartifact: Findings\nrun: r\nnode: reviewer\nattempt: 1\nmodel: m\ncreated: c\ninputs: []\nresults:\n  breaking: 1\n  risky: 0\n  minor: 0\n  unmet_requirements: 0\ndigest: |\n  One issue.\n---\n\n{body}\n"
+        );
+        assert!(parse(&text, &tk()).is_ok(), "a body quoting JSON was taken for an echo of the header");
+    }
+
+    #[test]
+    fn rejects_a_body_missing_a_required_section_and_names_it() {
+        let text = GOOD.replace("\nOut of scope:\n- Changing the tunnel protocol.\n", "\n");
+        let e = parse(&text, &tk()).unwrap_err();
+        assert_eq!(e, DocError::MissingSection { artifact: "Requirements", name: "Out of scope" });
+        assert!(e.guidance().contains("Out of scope"), "{}", e.guidance());
+    }
+
+    #[test]
+    fn a_section_is_recognised_however_the_model_dresses_it() {
+        for dressed in ["## Out of scope", "- Out of scope:", "**Out of scope**", "OUT OF SCOPE:", "> Out of scope"] {
+            let text = GOOD.replace("Out of scope:\n- Changing", &format!("{dressed}\n- Changing"));
+            assert!(
+                parse(&text, &tk()).is_ok(),
+                "a section written as `{dressed}` was rejected, which spends an attempt on punctuation"
+            );
+        }
+    }
+
+    #[test]
+    fn an_artifact_whose_role_asks_for_prose_demands_no_sections() {
+        // Measured over every document on disk before the rule was written: the
+        // only rejection was a RiskAssessment that is sound prose without a
+        // heading, and its role prompt asks for exactly that.
+        assert!(Artifact::RiskAssessment.required_sections().is_empty());
+        assert!(Artifact::Findings.required_sections().is_empty());
+        assert!(Artifact::Patch.required_sections().is_empty());
     }
 
     #[test]

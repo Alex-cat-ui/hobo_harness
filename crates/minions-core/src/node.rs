@@ -25,6 +25,19 @@ pub struct Role {
 /// change to the document format cannot drift from what roles are told.
 pub fn format_contract(artifact: Artifact, run: &str, node: &str, attempt: u32, model: &str, inputs: &[String]) -> String {
     let keys = artifact.required_results();
+    // Whatever the parser demands, the prompt has to have said. The body check
+    // (T-013) is enforced here as well as in the role prompt, because the probe
+    // asks for a document with this contract and no role prompt at all — and a
+    // model failing a rule nobody told it would have been measured as a model
+    // that cannot hold the format.
+    let sections = match artifact.required_sections() {
+        [] => String::new(),
+        names => format!(
+            "\n\nThe body must name each of these sections on its own line: {}. \
+             Any further structure the role asked for comes on top of them.",
+            names.join(", ")
+        ),
+    };
     let results_block = if keys.is_empty() {
         "  (none required)".to_string()
     } else {
@@ -46,7 +59,7 @@ pub fn format_contract(artifact: Artifact, run: &str, node: &str, attempt: u32, 
          digest: |\n\
          \x20 <two or three sentences of substance, with key numbers, at most 400 tokens>\n\
          ---\n\n\
-         <the document body, in the structure described above>\n",
+         <the document body, in the structure described above>{sections}\n",
         artifact = artifact.name(),
         run = run,
         node = node,
@@ -54,6 +67,7 @@ pub fn format_contract(artifact: Artifact, run: &str, node: &str, attempt: u32, 
         model = model,
         inputs = inputs.join(", "),
         results = results_block,
+        sections = sections,
     )
 }
 
@@ -198,7 +212,7 @@ mod tests {
     fn harness_fields_override_whatever_the_model_wrote() {
         use crate::document;
         use crate::tokens::CharRatioTokenizer;
-        let text = "---\nartifact: Requirements\nrun: made-up\nnode: impostor\nattempt: 9\nmodel: gpt-9\ncreated: 2023-10-07T19:24:41Z\ninputs: [nonsense.md]\nresults:\n  requirements: 2\n  unknowns: 0\ndigest: |\n  Something short.\n---\n\nBody.\n";
+        let text = "---\nartifact: Requirements\nrun: made-up\nnode: impostor\nattempt: 9\nmodel: gpt-9\ncreated: 2023-10-07T19:24:41Z\ninputs: [nonsense.md]\nresults:\n  requirements: 2\n  unknowns: 0\ndigest: |\n  Something short.\n---\n\nStatement: s.\n\nRequirements:\n1. one\n\nOut of scope:\n- nothing\n\nBody.\n";
         let mut doc = document::parse(text, &CharRatioTokenizer::default()).unwrap();
         let role = Role { name: "analyst", model: "qwen2.5:14b".into(), window: 8192, temperature: 0.5, artifact: Artifact::Requirements, system: "" };
         stamp_harness_fields(&mut doc, "2026-run", &role, 1, &["00_task.md".to_string()]);
@@ -210,7 +224,23 @@ mod tests {
         assert!(!doc.header.created.starts_with("2023"), "the model's invented timestamp survived");
         // what the model legitimately owns is untouched
         assert_eq!(doc.header.results.get("requirements").unwrap(), "2");
-        assert_eq!(doc.body, "Body.");
+        // The body is the model's; the harness stamps the header and nothing else.
+        assert!(doc.body.ends_with("Body."), "the body was rewritten: {}", doc.body);
+    }
+
+    #[test]
+    fn the_contract_names_the_sections_the_parser_will_demand() {
+        // Whatever the parser rejects a document for, the prompt has to have
+        // asked for. The probe sends this contract with no role prompt at all.
+        let c = format_contract(Artifact::Requirements, "r", "analyst", 1, "m", &[]);
+        for s in Artifact::Requirements.required_sections() {
+            assert!(c.contains(s), "the contract never names `{s}`, and a document without it is rejected");
+        }
+        let f = format_contract(Artifact::Findings, "r", "reviewer", 1, "m", &[]);
+        assert!(
+            !f.contains("must name each of these sections"),
+            "an artifact that requires no sections must not be told about sections"
+        );
     }
 
     #[test]

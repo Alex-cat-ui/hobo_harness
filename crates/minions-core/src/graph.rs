@@ -46,6 +46,16 @@ pub struct Node {
     /// Required of a Tool node: program first, then arguments.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// What a Tool node's document is. Absent means `TestReport` — which is
+    /// what every tool node used to be called, whether it ran a test suite or
+    /// listed files (finding 26).
+    #[serde(default)]
+    pub artifact: Option<String>,
+    /// A Tool node whose command must succeed. A non-zero exit ends the run and
+    /// names the command; until loops iterate (M5) this is how red tests stop a
+    /// run instead of flowing on into a review of broken code.
+    #[serde(default)]
+    pub requires_success: bool,
     #[serde(default)]
     pub gate: bool,
 }
@@ -263,6 +273,24 @@ impl Graph {
                 }
                 if n.command.as_ref().map(|c| c.is_empty()).unwrap_or(true) {
                     errors.push(GraphError::InvalidNode { id: n.id.clone(), why: "no command is set" });
+                }
+                // A command produces output, not judgement: it can fill a test
+                // report, which the harness counts itself, or a document type
+                // that demands no numbers. Anything else would need a model.
+                match n.artifact.as_deref().map(crate::document::Artifact::parse) {
+                    Some(None) => errors.push(GraphError::InvalidNode {
+                        id: n.id.clone(),
+                        why: "declares an artifact type that does not exist",
+                    }),
+                    Some(Some(a))
+                        if a != crate::document::Artifact::TestReport && !a.required_results().is_empty() =>
+                    {
+                        errors.push(GraphError::InvalidNode {
+                            id: n.id.clone(),
+                            why: "declares an artifact whose results a command cannot produce",
+                        })
+                    }
+                    _ => {}
                 }
             }
         }

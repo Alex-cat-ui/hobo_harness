@@ -33,6 +33,15 @@ time: on a toy project, one function and one test, the suite green and nothing
 lost. The reviewer that passed it reported a defect that does not reproduce and
 missed one that does.
 
+Later the same day it stopped being able to claim success over failing tests. The
+tests are a node in the graph again; the harness measures them itself before and
+after; a role that changes code cannot close its document while they are red; and
+the report says where they moved — `Tests: was 3/4 passing, now 4/4 passing`. Of
+three runs that evening, two ended in a refusal that named its reason and none
+reported a success it had not earned. What the harness still cannot do is the
+work: the coder writes a whole file, breaks it in the first line, and edits on
+blind from there.
+
 **Prefer a throwaway directory, and read the above before using `--yes`.**
 
 ## Running

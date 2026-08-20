@@ -148,7 +148,7 @@ mod tests {
 
     fn doc_with(unknowns: &str, body: &str) -> Document {
         let text = format!(
-            "---\nartifact: Requirements\nrun: r\nnode: analyst\nattempt: 1\nmodel: m\ncreated: c\ninputs: []\nresults:\n  requirements: 3\n  unknowns: {unknowns}\ndigest: |\n  Something.\n---\n\n{body}\n"
+            "---\nartifact: Requirements\nrun: r\nnode: analyst\nattempt: 1\nmodel: m\ncreated: c\ninputs: []\nresults:\n  requirements: 3\n  unknowns: {unknowns}\ndigest: |\n  Something.\n---\n\nStatement: s.\n\nRequirements:\n1. one\n\nOut of scope:\n- nothing\n\n{body}\n"
         );
         document::parse(&text, &CharRatioTokenizer::default()).unwrap()
     }

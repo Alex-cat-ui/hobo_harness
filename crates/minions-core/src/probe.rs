@@ -136,7 +136,7 @@ mod tests {
     use crate::tokens::CharRatioTokenizer;
 
     fn doc() -> String {
-        "---\nartifact: Requirements\nrun: r\nnode: n\nattempt: 1\nmodel: m\ncreated: c\ninputs: []\nresults:\n  requirements: 1\n  unknowns: 0\ndigest: |\n  Short.\n---\n\nBody.\n".to_string()
+        "---\nartifact: Requirements\nrun: r\nnode: n\nattempt: 1\nmodel: m\ncreated: c\ninputs: []\nresults:\n  requirements: 1\n  unknowns: 0\ndigest: |\n  Short.\n---\n\nStatement: s.\n\nRequirements:\n1. one\n\nOut of scope:\n- nothing\n\nBody.\n".to_string()
     }
 
     #[tokio::test]

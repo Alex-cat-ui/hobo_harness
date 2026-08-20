@@ -74,12 +74,46 @@ pub struct RoleSpec {
     /// self-resolution passes, then the human is asked.
     #[serde(default)]
     pub clarifies: bool,
+    /// When true, the node may not close its document while the project's tests
+    /// are failing. "When the tests pass, reply with your document" is a
+    /// sentence in a prompt; this is the same sentence measured.
+    #[serde(default)]
+    pub requires_green: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestBaseline {
     pub total: u32,
     pub failed: u32,
+}
+
+/// What the test numbers lost between the baseline and now. Two different
+/// losses, and one run can suffer both: tests that existed are gone, and more
+/// tests fail than did before. Counting only the first is how a run that broke
+/// three tests of six read as no regression at all — finding 2.
+///
+/// Counts carry no identity, so "three more failures" cannot tell a broken old
+/// test from a new test that fails. Both are refused, and what is said to the
+/// agent is the numbers, not names the harness does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Regression {
+    pub tests_lost: u32,
+    pub more_failures: u32,
+}
+
+impl Regression {
+    pub fn is_clean(&self) -> bool {
+        self.tests_lost == 0 && self.more_failures == 0
+    }
+}
+
+/// The comparison itself: a pure function over two measurements, so it can be
+/// stated as a table and mutation-tested.
+pub fn regression(base: TestBaseline, now: TestBaseline) -> Regression {
+    Regression {
+        tests_lost: base.total.saturating_sub(now.total),
+        more_failures: now.failed.saturating_sub(base.failed),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +130,11 @@ pub struct RunState {
     /// pass" cannot be told apart from a run that destroyed the other four.
     #[serde(default)]
     pub baseline: Option<TestBaseline>,
+    /// The last counts the harness measured itself, at an acceptance check or a
+    /// test node. With the baseline they make the movement — which is what a
+    /// report owes its reader, rather than a number with nothing beside it.
+    #[serde(default)]
+    pub tests: Option<TestBaseline>,
     #[serde(default)]
     pub finished: Option<String>,
     #[serde(default)]
@@ -112,6 +151,7 @@ impl RunState {
             documents: BTreeMap::new(),
             checkpoint: None,
             baseline: None,
+            tests: None,
             finished: None,
             failure: None,
         }
@@ -364,6 +404,19 @@ impl<'a> Engine<'a> {
             let path = self.run_dir.join(&run.documents[&doc_node]);
             let text = std::fs::read_to_string(&path)?;
             let doc = document::parse(&text, self.tokenizer).map_err(|e| anyhow!("{e}"))?;
+            // A report that measured nothing is not a green report. Taking
+            // the fallback here is how a run that never ran a test walked the
+            // way marked "tests passed" (finding 26).
+            if doc.header.artifact == Artifact::TestReport
+                && doc.header.results.get("conclusive").map(|c| c.as_str()) != Some("yes")
+            {
+                return Err(anyhow!(
+                    "branch `{}` reads `{}` from `{}`, and that report measured no tests — it says `conclusive: no`",
+                    node.id,
+                    cond.field,
+                    cond.document
+                ));
+            }
             let actual = doc.header.results.get(&cond.field).cloned().unwrap_or_default();
             if cond.holds(&actual) {
                 on_event(Event::Note(format!("branch: {}.{} = {} -> {}", cond.document, cond.field, actual, edge.to)));
@@ -436,7 +489,23 @@ impl<'a> Engine<'a> {
 
         out.push_str("## Course of the run\n\n");
         out.push_str(&format!("- Documents produced: {}\n", run.documents.len()));
-        out.push_str(&format!("- Repeated attempts: {}\n", run.attempts.values().filter(|a| **a > 1).count()));
+        // SPEC §5.11 asks for the movement rather than a number: "5 of 6
+        // passing" says nothing until it stands next to what it was.
+        let passing = |b: TestBaseline| format!("{}/{}", b.total.saturating_sub(b.failed), b.total);
+        out.push_str(&match (run.baseline, run.tests) {
+            (Some(b), Some(now)) => {
+                format!("- Tests: was {} passing, now {} passing\n", passing(b), passing(now))
+            }
+            (Some(b), None) => format!("- Tests: was {} passing; nothing measured them since\n", passing(b)),
+            (None, Some(now)) => format!("- Tests: {} passing, with no baseline to compare against\n", passing(now)),
+            (None, None) => "- Tests: never measured in this run\n".to_string(),
+        });
+        // "Repeated attempts" counted nodes, and until T-012 it counted tool
+        // steps as attempts on top of that — two different lies in one line.
+        out.push_str(&format!(
+            "- Nodes that took more than one attempt: {}\n",
+            run.attempts.values().filter(|a| **a > 1).count()
+        ));
         if !skipped.is_empty() {
             out.push_str(&format!("- Not taken: {}\n", skipped.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
         }
@@ -486,11 +555,44 @@ impl<'a> Engine<'a> {
         };
 
         let combined = if stderr.trim().is_empty() { stdout.clone() } else { format!("{stdout}\n{stderr}") };
-        let doc = tool_document(&run.run_id, &node.id, &command.join(" "), exit_code, &combined);
+        // Absent means `TestReport`, which is what every tool node used to be
+        // called whether it ran a suite or listed files.
+        let artifact = match node.artifact.as_deref() {
+            Some(name) => Artifact::parse(name)
+                .ok_or_else(|| anyhow!("`{}` declares the artifact `{name}`, which does not exist", node.id))?,
+            None => Artifact::TestReport,
+        };
+        let doc = tool_document(
+            &run.run_id,
+            &node.id,
+            artifact,
+            &command.join(" "),
+            exit_code,
+            &combined,
+            run.baseline,
+        );
+        if artifact == Artifact::TestReport {
+            let counts = parse_test_output(&combined);
+            if counts.conclusive {
+                run.tests = Some(TestBaseline { total: counts.total, failed: counts.failed });
+            }
+        }
         std::fs::create_dir_all(&self.run_dir)?;
         std::fs::write(self.run_dir.join(&output), doc)?;
         run.documents.insert(node.id.clone(), output.clone());
         on_event(Event::Note(format!("{} wrote {output} (exit {exit_code})", node.id)));
+
+        // The document is written first: what happened is recorded before the
+        // run stops on it. Until loops iterate (M5), this is how a red suite
+        // ends a run instead of flowing on into a review of broken code.
+        if node.requires_success && exit_code != 0 {
+            return Err(anyhow!(
+                "`{}` must succeed and did not: `{}` gave exit {exit_code}. It printed:\n{}",
+                node.id,
+                command.join(" "),
+                truncate(combined.trim(), 1200)
+            ));
+        }
         Ok(())
     }
 
@@ -681,7 +783,11 @@ impl<'a> Engine<'a> {
 
     /// Runs the project's tests and reads its counts. Returns None when the
     /// output carries no summary, because a missing count is not a zero.
-    pub fn measure_tests(&mut self, command: &[String]) -> Option<TestBaseline> {
+    /// Runs the project's test command and hands back both what it counted
+    /// and what it printed. The output is kept because a node told "one test
+    /// fails", without being told which, edits blind — that is finding 41,
+    /// measured on the run of 2026-08-20 evening.
+    fn run_tests(&mut self, command: &[String]) -> Option<(TestCounts, String)> {
         let dispatcher = self.dispatcher.as_mut()?;
         dispatcher.for_node("baseline", 1);
         let outcome = dispatcher
@@ -694,8 +800,78 @@ impl<'a> Engine<'a> {
             )
             .ok()?;
         let crate::dispatcher::Outcome::Ran { stdout, stderr, .. } = outcome else { return None };
-        let counts = parse_test_output(&format!("{stdout}\n{stderr}"));
+        let text = format!("{stdout}\n{stderr}");
+        Some((parse_test_output(&text), text))
+    }
+
+    pub fn measure_tests(&mut self, command: &[String]) -> Option<TestBaseline> {
+        let (counts, _) = self.run_tests(command)?;
         counts.conclusive.then_some(TestBaseline { total: counts.total, failed: counts.failed })
+    }
+
+    /// The one place where a node's claim to have finished is checked against a
+    /// measurement instead of believed. Returns what to say back to the agent,
+    /// or `None` if the claim stands.
+    ///
+    /// One test run answers both questions, in this order: is the suite green
+    /// where the role demands green, and has anything been lost against the
+    /// baseline. A run that cannot be counted blocks nothing — it is recorded
+    /// and the document is accepted unmeasured, because refusing on a number
+    /// nobody has is the disease this whole milestone is about.
+    fn acceptance(
+        &mut self,
+        role: &RoleSpec,
+        run: &mut RunState,
+        node: &str,
+        on_event: &mut (dyn FnMut(Event<'_>) + Send),
+    ) -> Option<String> {
+        if !role.requires_green && run.baseline.is_none() {
+            return None;
+        }
+        let cmd = self.test_command.clone()?;
+        let (counts, output) = self.run_tests(&cmd)?;
+        if !counts.conclusive {
+            on_event(Event::Note(format!(
+                "{node}: the test command printed no summary, so this document is accepted unmeasured"
+            )));
+            return None;
+        }
+        let now = TestBaseline { total: counts.total, failed: counts.failed };
+        run.tests = Some(now);
+
+        if role.requires_green && now.failed > 0 {
+            on_event(Event::Note(format!("{node}: {} of {} tests failing — refused", now.failed, now.total)));
+            return Some(format!(
+                "You reported the work as finished, and the tests say otherwise: {} of {} are failing. This is \
+                 what they printed:\n\n{}\n\nRead it, fix what it names, run the tests again, and reply with \
+                 your document only once they pass.",
+                now.failed,
+                now.total,
+                truncate(&output, 2000)
+            ));
+        }
+
+        if let Some(base) = run.baseline {
+            let lost = regression(base, now);
+            if !lost.is_clean() {
+                on_event(Event::Note(format!(
+                    "{node}: {} tests before, {} now; {} failing before, {} now — refused",
+                    base.total, now.total, base.failed, now.failed
+                )));
+                let what = match (lost.tests_lost, lost.more_failures) {
+                    (0, k) => format!("{k} more test(s) fail than before."),
+                    (n, 0) => format!("{n} test(s) that existed are gone."),
+                    (n, k) => format!("{n} test(s) that existed are gone, and {k} more fail than before."),
+                };
+                return Some(format!(
+                    "Before you started there were {} tests, {} of them failing; now there are {}, {} failing. \
+                     {what} Restore what was there, fix what broke, run the tests again, and only then reply \
+                     with your document.",
+                    base.total, base.failed, now.total, now.failed
+                ));
+            }
+        }
+        None
     }
 
     /// Taken before any agent acts, which is the only moment it means anything.
@@ -791,11 +967,22 @@ impl<'a> Engine<'a> {
         run: &mut RunState,
         on_event: &mut (dyn FnMut(Event<'_>) + Send),
     ) -> Result<()> {
+        // How many times one call may give one failure before the node is
+        // stopped. Three is the warning (T-009), four is the end.
+        const SAME_FAILURE_LIMIT: usize = 4;
+
         let max_steps = role.max_steps.unwrap_or(12);
         // A tool-using role sends whole files, so it needs more room than one
         // that answers in prose — which is exactly what the role can now say.
         let room = answer_room(role, 1600);
-        let base = self.assemble(&node.id, role, run, 1, model, artifact, room as usize, on_event)?;
+        // Steps are not attempts. The node is asked once and then works in
+        // steps; an attempt is another asking, which is what the outer loop of
+        // T-026 will add. Writing the step count here made the report of 16.08
+        // call a nine-step node nine repeats, and stamped `attempt: 9` on a
+        // document nobody had asked for twice.
+        let attempt = run.attempts.get(&node.id).copied().unwrap_or(0) + 1;
+        run.attempts.insert(node.id.clone(), attempt);
+        let base = self.assemble(&node.id, role, run, attempt, model, artifact, room as usize, on_event)?;
         let skill = self.load_skill(role);
         // The harness measured the baseline with a command it used to keep to
         // itself. The model then guessed: six steps of the run of 2026-08-19
@@ -914,33 +1101,28 @@ impl<'a> Engine<'a> {
                             }
                         }
                         // Writing something is not the same as not destroying
-                        // something. A run that adds two tests and deletes four
-                        // has gone backwards, and only the baseline can say so.
-                        let baseline_cmd = self.test_command.clone();
-                        if let (Some(base), Some(cmd)) = (run.baseline, baseline_cmd) {
-                            if let Some(now) = self.measure_tests(&cmd) {
-                                if now.total < base.total {
-                                    on_event(Event::Note(format!(
-                                        "{}: {} tests before, {} now — refused",
-                                        node.id, base.total, now.total
-                                    )));
-                                    messages.push(Message::assistant(reply.text.clone()));
-                                    messages.push(Message::user(format!(
-                                        "There were {} tests before you started and there are {} now. You have \
-                                         deleted tests that existed. Restore every test that was there and keep \
-                                         your own as well, then run the tests again.",
-                                        base.total, now.total
-                                    )));
-                                    continue;
-                                }
-                            }
+                        // something, and neither is the same as the work being
+                        // done. One measurement answers both, in `acceptance`.
+                        if let Some(refusal) = self.acceptance(role, run, &node.id, on_event) {
+                            messages.push(Message::assistant(reply.text.clone()));
+                            messages.push(Message::user(refusal));
+                            continue;
                         }
-                        stamp(&mut doc, &run.run_id, &node.id, step, model);
+                        stamp(&mut doc, &run.run_id, &node.id, attempt, model);
+                        // How much work the node took, under a name that says
+                        // so. Not `results.steps`: a Plan document is required
+                        // to carry `steps` of its own, and those are the plan's.
+                        doc.header.results.insert("tool_steps".to_string(), step.to_string());
+                        // Documents are immutable, so a second attempt writes
+                        // its own file rather than over the first one.
+                        let file = match attempt > 1 {
+                            true => numbered(output, attempt),
+                            false => output.to_string(),
+                        };
                         std::fs::create_dir_all(&self.run_dir)?;
-                        std::fs::write(self.run_dir.join(output), document::render(&doc))?;
-                        run.documents.insert(node.id.clone(), output.to_string());
-                        run.attempts.insert(node.id.clone(), step);
-                        on_event(Event::Note(format!("{} wrote {output} after {step} steps", node.id)));
+                        std::fs::write(self.run_dir.join(&file), document::render(&doc))?;
+                        run.documents.insert(node.id.clone(), file.clone());
+                        on_event(Event::Note(format!("{} wrote {file} after {step} steps", node.id)));
                         return Ok(());
                     }
                     Err(e) => {
@@ -1021,10 +1203,24 @@ impl<'a> Engine<'a> {
                 // Only the harness sees the repetition: the model has just been
                 // shown the failure and sent the same thing anyway.
                 if let Some(how) = fruitless {
+                    // Keyed by the call *and* what it produced: re-running the
+                    // tests after a real edit is work, and its output differs.
+                    // The same call giving the same output is not work.
                     let times = *failures
-                        .entry(format!("{call:?}"))
+                        .entry(format!("{call:?} -> {}", outcome_signature(&text)))
                         .and_modify(|n| *n += 1)
                         .or_insert(1);
+                    // Naming the repetition changed nothing in the run of
+                    // 2026-08-20: the model was told sixteen times and went on
+                    // to eighteen, spending fourteen steps and fifteen minutes
+                    // (finding 40). So the node stops.
+                    if times >= SAME_FAILURE_LIMIT {
+                        return Err(anyhow!(
+                            "`{}` made the same call {times} times and got the same failure every time — {summary}, \
+                             {how}. The node is not making progress.",
+                            node.id
+                        ));
+                    }
                     if times >= 3 {
                         let instead = match (&call, self.test_command_line()) {
                             (crate::sandbox::ToolCall::RunCommand { .. }, Some(line)) => {
@@ -1286,23 +1482,90 @@ pub fn parse_test_output(output: &str) -> TestCounts {
 
 /// A tool result becomes a document without a model touching it, so nothing
 /// can be embellished on the way in.
-pub fn tool_document(run_id: &str, node: &str, command: &str, exit_code: i32, output: &str) -> String {
+pub fn tool_document(
+    run_id: &str,
+    node: &str,
+    artifact: Artifact,
+    command: &str,
+    exit_code: i32,
+    output: &str,
+    baseline: Option<TestBaseline>,
+) -> String {
     let counts = parse_test_output(output);
     let head: String = output.lines().take(200).collect::<Vec<_>>().join("\n");
-    let digest = if counts.conclusive {
-        format!("`{command}` ran {} tests, {} failed (exit {exit_code}).", counts.total, counts.failed)
-    } else {
-        format!(
-            "`{command}` exited {exit_code}. The output carries no test summary, so the counts below are not a verdict."
-        )
+    // Only a test report has anything to be conclusive about. A node that
+    // lists files says what it ran and shows what came back.
+    let is_report = artifact == Artifact::TestReport;
+    let digest = match (is_report, counts.conclusive) {
+        (true, true) => {
+            format!("`{command}` ran {} tests, {} failed (exit {exit_code}).", counts.total, counts.failed)
+        }
+        (true, false) => format!(
+            "`{command}` exited {exit_code}. The output carries no test summary, so this report measures nothing \
+             and carries no numbers."
+        ),
+        (false, _) => format!("`{command}` exited {exit_code}. Its output is below, unchanged."),
+    };
+    // What was not measured is not written. Until now every tool node — a
+    // file dump included — produced `failed: 0`, and a branch reads `results`.
+    let results = match (is_report, counts.conclusive) {
+        (true, true) => {
+            let mut r = format!(
+                "  conclusive: yes\n  total: {}\n  passed: {}\n  failed: {}\n",
+                counts.total,
+                counts.total.saturating_sub(counts.failed),
+                counts.failed
+            );
+            // Where the run started, so the document itself carries the
+            // movement and not only a number.
+            if let Some(b) = baseline {
+                r.push_str(&format!("  baseline_total: {}\n  baseline_failed: {}\n", b.total, b.failed));
+            }
+            r
+        }
+        (true, false) => "  conclusive: no\n".to_string(),
+        (false, _) => String::new(),
     };
     format!(
-        "---\nartifact: TestReport\nrun: {run_id}\nnode: {node}\nattempt: 1\nmodel: harness\ncreated: {}\ninputs: []\nresults:\n  total: {}\n  passed: {}\n  failed: {}\n  baseline_total: 0\n  baseline_passed: 0\ndigest: |\n  {digest}\n---\n\n$ {command}\n\n{head}\n",
+        "---\nartifact: {}\nrun: {run_id}\nnode: {node}\nattempt: 1\nmodel: harness\ncreated: {}\ninputs: []\nresults:\n{results}digest: |\n  {digest}\n---\n\n$ {command}\n\n{head}\n",
+        artifact.name(),
         now_utc(),
-        counts.total,
-        counts.total.saturating_sub(counts.failed),
-        counts.failed,
     )
+}
+
+/// A fingerprint of what a call produced, steady across the one thing that
+/// changes by itself: a suite prints how long it took, and a failure differing
+/// only there is the same failure.
+///
+/// Only durations are erased — a number followed by `s`, with a decimal point
+/// in it. Collapsing every number was the first attempt and its own unit test
+/// refused it: `9045 != 0` and `7507 != 0` are two different failures, and a
+/// node working through numbers would have been stopped for making progress.
+fn outcome_signature(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if !ch.is_ascii_digit() {
+            out.push(ch);
+            continue;
+        }
+        let mut token = String::from(ch);
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() || c == '.' {
+                token.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if token.contains('.') && chars.peek() == Some(&'s') {
+            chars.next();
+            out.push_str("#s");
+        } else {
+            out.push_str(&token);
+        }
+    }
+    out
 }
 
 fn describe(call: &crate::sandbox::ToolCall) -> String {
@@ -1396,6 +1659,95 @@ mod tests {
     use crate::backend::ReplayBackend;
     use crate::graph::Graph;
 
+    #[test]
+    fn a_failure_signature_ignores_what_changes_by_itself() {
+        // The same failure, timed twice.
+        assert_eq!(
+            outcome_signature("Ran 4 tests in 0.001s\nFAILED (failures=1)"),
+            outcome_signature("Ran 4 tests in 0.130s\nFAILED (failures=1)")
+        );
+        // A different failure is a different signature, and that is what lets
+        // a node keep working after a real edit.
+        assert_ne!(
+            outcome_signature("AssertionError: 9045 != 0"),
+            outcome_signature("AssertionError: 7507 != 0")
+        );
+        assert_ne!(
+            outcome_signature("ImportError: cannot import parse_duration"),
+            outcome_signature("AssertionError: 9045 != 0")
+        );
+    }
+
+    /// Finding 26: every tool node produced a `TestReport`, and one that ran
+    /// no tests produced zeros. `00_context.md` of the run 2026-08-16T18-41-51
+    /// is a dump of two Python files recorded as "0 failed".
+    #[test]
+    fn a_command_that_measured_no_tests_writes_no_numbers() {
+        let dump = "===== src/durations.py\n\"\"\"Duration helpers.\"\"\"\n\ndef format_seconds(total: int) -> str:\n    return \"\"\n===== tests/test_durations.py\nimport unittest\n";
+        let d =
+            tool_document("r1", "read", Artifact::TestReport, "bash -lc 'for f in src/*.py; do cat $f; done'", 0, dump, None);
+        // Asserted over the parsed results, not over the text: the body of
+        // this document is the dump itself, and it contains the word `total:`
+        // in a function signature.
+        let parsed = document::parse(&d, &CharRatioTokenizer::default())
+            .expect("the harness must write a document that its own parser accepts");
+        assert_eq!(parsed.header.results.get("conclusive").map(String::as_str), Some("no"));
+        assert_eq!(
+            parsed.header.results.len(),
+            1,
+            "a report that measured nothing carries one key and no numbers: {:?}",
+            parsed.header.results
+        );
+    }
+
+    #[test]
+    fn a_real_test_run_writes_what_it_measured() {
+        let out = "..F.\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=1)\n";
+        let d = tool_document(
+            "r1",
+            "tests",
+            Artifact::TestReport,
+            "python3 -m unittest",
+            1,
+            out,
+            Some(TestBaseline { total: 4, failed: 0 }),
+        );
+        assert!(d.contains("baseline_total: 4"), "the report does not say where the run started:\n{d}");
+        assert!(d.contains("conclusive: yes"), "{d}");
+        assert!(d.contains("total: 4"), "{d}");
+        assert!(d.contains("failed: 1"), "{d}");
+        assert!(d.contains("passed: 3"), "{d}");
+        document::parse(&d, &CharRatioTokenizer::default()).expect("the harness must write a valid document");
+    }
+
+    /// Finding 2: the check compared only how many tests exist, so breaking
+    /// three of six without deleting any read as no regression at all.
+    #[test]
+    fn a_regression_is_a_test_lost_or_a_test_broken() {
+        // base (total, failed), now (total, failed), lost, newly failing
+        let table = [
+            ((6, 0), (6, 0), 0, 0),
+            ((6, 0), (8, 0), 0, 0), // two tests added and still green
+            ((6, 0), (3, 0), 3, 0), // three deleted, the rest pass
+            ((6, 0), (6, 3), 0, 3), // nothing deleted, three broken
+            ((6, 2), (6, 1), 0, 0), // a failure was fixed
+            ((6, 2), (6, 2), 0, 0), // the same red as before is not new
+            ((6, 2), (4, 3), 2, 1), // both losses at once
+        ];
+        for ((bt, bf), (nt, nf), lost, broken) in table {
+            let base = TestBaseline { total: bt, failed: bf };
+            let now = TestBaseline { total: nt, failed: nf };
+            let r = regression(base, now);
+            assert_eq!(r.tests_lost, lost, "tests lost, {base:?} -> {now:?}");
+            assert_eq!(r.more_failures, broken, "new failures, {base:?} -> {now:?}");
+            assert_eq!(
+                r.is_clean(),
+                lost == 0 && broken == 0,
+                "the verdict disagrees with its own numbers, {base:?} -> {now:?}"
+            );
+        }
+    }
+
     fn a_role(window: u32, primary: &[&str]) -> RoleSpec {
         RoleSpec {
             name: "analyst".into(),
@@ -1411,16 +1763,23 @@ mod tests {
             max_output: None,
             must_write: false,
             clarifies: false,
+            requires_green: false,
         }
     }
 
     fn a_document(dir: &Path, file: &str, artifact: &str, digest: &str, body: &str) {
-        // Every artifact demands its own results keys, so the fixture supplies
-        // the ones the parser will ask for.
+        // Every artifact demands its own results keys and its own sections, so
+        // the fixture supplies what the parser will ask for. A fixture that
+        // would be rejected in a run proves nothing about a run.
         let results: &[(&str, &str)] = match artifact {
             "Requirements" => &[("requirements", "1"), ("unknowns", "0")],
             "Plan" => &[("steps", "1"), ("risks", "0"), ("verdict", "ok")],
             _ => &[],
+        };
+        let sections = match artifact {
+            "Requirements" => "Statement: s.\n\nRequirements:\n1. one\n\nOut of scope:\n- nothing\n\n",
+            "Plan" => "Approach: a.\n\nRejected alternatives: b.\n\nSteps:\n1. one\n\n",
+            _ => "",
         };
         let mut r = String::new();
         for (k, v) in results {
@@ -1429,7 +1788,7 @@ mod tests {
         std::fs::write(
             dir.join(file),
             format!(
-                "---\nartifact: {artifact}\nrun: r1\nnode: n\nattempt: 1\nmodel: m\ncreated: now\ninputs: []\nresults:\n{r}digest: |\n  {digest}\n---\n\n{body}\n"
+                "---\nartifact: {artifact}\nrun: r1\nnode: n\nattempt: 1\nmodel: m\ncreated: now\ninputs: []\nresults:\n{r}digest: |\n  {digest}\n---\n\n{sections}{body}\n"
             ),
         )
         .unwrap();

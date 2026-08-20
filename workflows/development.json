@@ -14,7 +14,8 @@
           "bash",
           "-lc",
           "for f in src/*.py tests/*.py; do echo \"===== $f\"; cat \"$f\"; done"
-        ]
+        ],
+        "artifact": "Report"
       },
       {
         "id": "analyst",
@@ -37,6 +38,17 @@
         "slot": "reasoning",
         "output": "03_changes.md",
         "gate": true
+      },
+      {
+        "id": "test",
+        "kind": "tool",
+        "output": "04_test-report.md",
+        "command": [
+          "bash",
+          "-lc",
+          "set -o pipefail; python3 -m unittest discover -s tests 2>&1 | tail -25"
+        ],
+        "requires_success": true
       },
       {
         "id": "review",
@@ -73,6 +85,10 @@
       },
       {
         "from": "coder",
+        "to": "test"
+      },
+      {
+        "from": "test",
         "to": "review"
       }
     ]
@@ -121,7 +137,8 @@
       "tools": true,
       "max_steps": 14,
       "max_output": 4096,
-      "must_write": true
+      "must_write": true,
+      "requires_green": true
     },
     "reviewer": {
       "name": "reviewer",
