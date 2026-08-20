@@ -46,10 +46,21 @@ struct GenerateChunk {
     response: String,
     #[serde(default)]
     done: bool,
+    /// Why the model stopped. `"length"` means it was cut off at
+    /// `num_predict`, which otherwise looks exactly like a finished answer.
+    #[serde(default)]
+    done_reason: Option<String>,
     #[serde(default)]
     eval_count: Option<u32>,
     #[serde(default)]
     prompt_eval_count: Option<u32>,
+}
+
+/// The server says why it stopped; only one of the reasons means the answer is
+/// unfinished. Kept as a function so the rule is stated once and can be tested
+/// without a server.
+fn cut_off_at_the_limit(done_reason: Option<&str>) -> bool {
+    done_reason == Some("length")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,6 +68,10 @@ pub struct Completion {
     pub text: String,
     pub prompt_tokens: u32,
     pub eval_tokens: u32,
+    /// The answer stopped because it ran out of room, not because it was
+    /// finished. A node that reports "malformed document" on a cut-off answer
+    /// is blaming the model for the harness's own limit.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,6 +219,7 @@ impl Ollama {
                 if c.done {
                     out.prompt_tokens = c.prompt_eval_count.unwrap_or(0);
                     out.eval_tokens = c.eval_count.unwrap_or(0);
+                    out.truncated = cut_off_at_the_limit(c.done_reason.as_deref());
                 }
             }
         }
@@ -251,6 +267,8 @@ struct ChatChunk {
     #[serde(default)]
     done: bool,
     #[serde(default)]
+    done_reason: Option<String>,
+    #[serde(default)]
     eval_count: Option<u32>,
     #[serde(default)]
     prompt_eval_count: Option<u32>,
@@ -262,6 +280,8 @@ pub struct ChatReply {
     pub tool_calls: Vec<ToolCallRequest>,
     pub prompt_tokens: u32,
     pub eval_tokens: u32,
+    /// See `Completion::truncated`.
+    pub truncated: bool,
 }
 
 impl Ollama {
@@ -320,9 +340,39 @@ impl Ollama {
                 if c.done {
                     out.prompt_tokens = c.prompt_eval_count.unwrap_or(0);
                     out.eval_tokens = c.eval_count.unwrap_or(0);
+                    out.truncated = cut_off_at_the_limit(c.done_reason.as_deref());
                 }
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chunk_says_why_the_model_stopped() {
+        // Real lines from `/api/chat`, shortened. Nothing else in the stream
+        // tells these two apart: both carry `done: true` and an empty content.
+        let cut = r#"{"model":"qwen2.5:7b","message":{"role":"assistant","content":""},"done_reason":"length","done":true,"prompt_eval_count":31,"eval_count":16}"#;
+        let finished = r#"{"model":"qwen2.5:7b","message":{"role":"assistant","content":""},"done_reason":"stop","done":true,"prompt_eval_count":31,"eval_count":94}"#;
+
+        let cut: ChatChunk = serde_json::from_str(cut).expect("a real chunk decodes");
+        let finished: ChatChunk = serde_json::from_str(finished).expect("a real chunk decodes");
+
+        assert!(cut_off_at_the_limit(cut.done_reason.as_deref()));
+        assert!(!cut_off_at_the_limit(finished.done_reason.as_deref()));
+        // Older servers send no reason at all; silence is not a cut-off.
+        assert!(!cut_off_at_the_limit(None));
+        assert_eq!(cut.eval_count, Some(16));
+    }
+
+    #[test]
+    fn a_generate_chunk_says_it_too() {
+        let cut = r#"{"model":"qwen2.5:7b","response":"","done_reason":"length","done":true,"eval_count":16}"#;
+        let c: GenerateChunk = serde_json::from_str(cut).expect("a real chunk decodes");
+        assert!(cut_off_at_the_limit(c.done_reason.as_deref()));
     }
 }

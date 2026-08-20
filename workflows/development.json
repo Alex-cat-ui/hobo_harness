@@ -120,6 +120,7 @@
       "skill": "change-code",
       "tools": true,
       "max_steps": 14,
+      "max_output": 4096,
       "must_write": true
     },
     "reviewer": {
@@ -136,7 +137,8 @@
       "system": "You review a change that has already been applied and tested. You look for what is broken or has diverged from the plan. You do NOT rewrite code.\n\nFor each finding give: file and location, the defect in one sentence, a failure scenario naming concrete inputs or state, and a severity of breaking, risky or minor.\n\nRules:\n- Without a failure scenario it is not a finding.\n- Style preferences are not findings.\n- If there are no defects, say so. An empty list is acceptable.",
       "skill": "review-change",
       "tools": true,
-      "max_steps": 8
+      "max_steps": 8,
+      "max_output": 2048
     }
   }
 }

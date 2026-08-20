@@ -190,3 +190,31 @@ fn a_patch_reaching_outside_the_root_is_refused_before_git_sees_it() {
     let out = d.dispatch(ToolCall::ApplyPatch { diff: diff.into() }, false).unwrap();
     assert!(matches!(out, Outcome::Refused(_)), "patch escaping the root must be refused");
 }
+
+#[test]
+fn a_write_through_a_dangling_symlink_never_reaches_what_it_points_at() {
+    // Finding 24, shown by executing it rather than by reading the resolver:
+    // the link sits inside the root, its target does not, and `Path::exists`
+    // answers false for both — which is how the write got out.
+    let (dir, auth) = setup(vec![]); // nothing scripted: any gate is a refusal
+    let root = dir.path().join("project");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let stolen = outside.join("stolen.txt");
+    std::os::unix::fs::symlink(&stolen, root.join("escape")).unwrap();
+
+    let run = dir.path().join("run");
+    let mut d = dispatcher(&root, PermissionMode::DoNotAskInsideSandbox, &auth, &run);
+    let out = d
+        .dispatch(ToolCall::WriteFile { path: root.join("escape"), content: "OWNED\n".into() }, false)
+        .unwrap();
+
+    assert!(matches!(out, Outcome::Refused(_)), "the write was performed: {out:?}");
+    assert!(!stolen.exists(), "a write left the root: {} exists now", stolen.display());
+    assert_eq!(
+        auth.asked(),
+        vec![(GateReason::WriteOutsideRoot, false)],
+        "the call must be judged by where the link points"
+    );
+}

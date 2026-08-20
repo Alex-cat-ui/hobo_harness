@@ -141,8 +141,13 @@ async fn main() -> Result<()> {
         anyhow::bail!("ollama is not reachable — run tools/ollama.sh up");
     }
 
+    // The coding slot is bound to the general model, not the coding-tuned one.
+    // Measured, not assumed: qwen2.5-coder:14b wrote no file in three runs and
+    // forty steps, never used the tool channel and never held the document
+    // format, while qwen2.5:14b did all three (STATUS §6). Its coding tuning
+    // appears to have cost it agentic behaviour, and this harness is agentic.
     let slots = BTreeMap::from([
-        ("coding".to_string(), "qwen2.5-coder:14b".to_string()),
+        ("coding".to_string(), "qwen2.5:14b".to_string()),
         ("reasoning".to_string(), "qwen2.5:14b".to_string()),
         ("chat".to_string(), "qwen2.5:7b".to_string()),
         ("embedding".to_string(), "nomic-embed-text".to_string()),

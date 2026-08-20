@@ -249,6 +249,26 @@ pub fn to_tool_call(req: &ToolCallRequest) -> Result<crate::sandbox::ToolCall, S
     }
 }
 
+/// The command line an agent has to send to get this argv run. The inverse of
+/// the wrapper `to_tool_call` puts on every `run_command`: the harness keeps its
+/// own test command as an argv with a shell in front of it, and handing that to
+/// a model as it stands would wrap it a second time.
+pub fn command_line(argv: &[String]) -> String {
+    const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
+    if let [program, flag, script] = argv {
+        let base = std::path::Path::new(program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        let carries_a_script = flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c');
+        if SHELLS.contains(&base.as_str()) && carries_a_script {
+            return script.clone();
+        }
+    }
+    argv.join(" ")
+}
+
 /// How a call reached us. Recorded because the mix is a measure of how well
 /// the pairing works: `qwen2.5-coder:14b` declares the tools capability and
 /// then writes its calls into the text instead of the channel, which is
@@ -376,13 +396,46 @@ mod tests {
 
     #[test]
     fn a_command_becomes_a_shell_invocation_the_sandbox_can_judge() {
-        match to_tool_call(&req("run_command", json!({"command": "python3 -m unittest"}))).unwrap() {
+        // This test used to check only the shape, while its name claimed the
+        // consequence — and the consequence was false: the sandbox saw the
+        // program `bash` and never the script, so no command a model issued
+        // reached the floor (finding 25). The claim is now made where it is
+        // built, so the two cannot drift apart again.
+        use crate::sandbox::{classify, GateReason, PermissionMode, Request, Verdict};
+
+        let ordinary = to_tool_call(&req("run_command", json!({"command": "python3 -m unittest"}))).unwrap();
+        match &ordinary {
             ToolCall::RunCommand { program, args } => {
                 assert_eq!(program, "bash");
-                assert_eq!(args, vec!["-lc".to_string(), "python3 -m unittest".to_string()]);
+                assert_eq!(args, &vec!["-lc".to_string(), "python3 -m unittest".to_string()]);
             }
             other => panic!("expected a command, got {other:?}"),
         }
+
+        let root = std::path::Path::new("/tmp/minions-root");
+        let judge = |call: &ToolCall| {
+            classify(&Request {
+                call,
+                root,
+                mode: PermissionMode::DoNotAskInsideSandbox,
+                consents: &[],
+                node_gate: false,
+                source_roots: &[],
+            })
+        };
+
+        assert_eq!(
+            judge(&ordinary),
+            Verdict::Gated { reason: GateReason::Command, consentable: true },
+            "running the tests must stay possible unattended"
+        );
+
+        let dangerous = to_tool_call(&req("run_command", json!({"command": "sudo rm -rf /"}))).unwrap();
+        assert_eq!(
+            judge(&dangerous),
+            Verdict::Gated { reason: GateReason::PrivilegeEscalation, consentable: false },
+            "the floor must read the script, not the word `bash`"
+        );
     }
 
     #[test]
@@ -450,6 +503,22 @@ mod tests {
     fn a_turn_without_calls_carries_no_empty_field() {
         let v = serde_json::to_value(Message::assistant("just words")).unwrap();
         assert!(v.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn a_shell_wrapped_command_is_shown_as_the_command_itself() {
+        let argv = ["bash", "-lc", "python3 -m unittest discover -s tests"].map(String::from);
+        assert_eq!(command_line(&argv), "python3 -m unittest discover -s tests");
+        // And the way back: what run_command makes of that line is the argv we
+        // started from, so the model is told a command it can actually send.
+        let back = to_tool_call(&req("run_command", json!({"command": command_line(&argv)}))).unwrap();
+        assert_eq!(back, ToolCall::RunCommand { program: "bash".into(), args: argv[1..].to_vec() });
+    }
+
+    #[test]
+    fn a_command_that_is_not_a_shell_invocation_is_shown_whole() {
+        let argv = ["cargo", "test", "--all"].map(String::from);
+        assert_eq!(command_line(&argv), "cargo test --all");
     }
 
     #[test]

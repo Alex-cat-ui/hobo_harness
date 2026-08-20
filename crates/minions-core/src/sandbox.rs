@@ -48,6 +48,15 @@ pub enum GateReason {
     Network,
     PrivilegeEscalation,
     NodeGate,
+    /// A git subcommand that rewrites the working tree or moves a ref — one of
+    /// them destroys the point the run is rolled back to.
+    RepositoryRewrite,
+    /// The shell writes a file itself, where the journal cannot see it and the
+    /// rollback cannot find it.
+    ShellRedirect,
+    /// The text does not name what will run: `eval`, or a command substitution
+    /// standing where a program name should be.
+    OpaqueCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +103,12 @@ pub struct Request<'a> {
 }
 
 /// Programs that can never be granted by scoped consent, whatever the mode.
+///
+/// A model never names a program. `chat::to_tool_call` turns every
+/// `run_command` into `bash -lc <script>`, so what this function used to see
+/// was always `bash`, and the floor was dead for everything an agent ran
+/// (finding 25). The shell is therefore transparent here: the script is read
+/// and every command in it is judged by this same function.
 fn floor_category(program: &str, args: &[String]) -> Option<GateReason> {
     let base = Path::new(program)
         .file_name()
@@ -109,15 +124,46 @@ fn floor_category(program: &str, args: &[String]) -> Option<GateReason> {
         "brew" | "apt" | "apt-get" | "yum" | "dnf" | "pacman" | "gem" | "pipx" => {
             return Some(GateReason::PackageInstall)
         }
+        // `DeleteFile` is on the floor in every mode, and a command was the way
+        // round it: the same effect, one word of shell away.
+        "rm" | "rmdir" | "unlink" | "shred" => return Some(GateReason::Delete),
+        // Runs something this text does not name, so nothing below can judge it.
+        "eval" | "source" | "." => return Some(GateReason::OpaqueCommand),
         _ => {}
     }
 
     let a: Vec<String> = args.iter().map(|s| s.to_ascii_lowercase()).collect();
 
     if base == "git" {
-        const REMOTE: [&str; 7] = ["push", "pull", "fetch", "clone", "remote", "submodule", "archive"];
-        if a.iter().any(|x| REMOTE.contains(&x.as_str())) {
-            return Some(GateReason::RemoteRepository);
+        // The subcommand is the word that decides, and it is the first word
+        // that is not a flag. Reading any argument instead made a commit
+        // message saying "push" gate as a push.
+        if let Some(sub) = git_subcommand(&a) {
+            const REMOTE: [&str; 7] = ["push", "pull", "fetch", "clone", "remote", "submodule", "archive"];
+            if REMOTE.contains(&sub) {
+                return Some(GateReason::RemoteRepository);
+            }
+
+            // Rewrites the working tree or moves a ref. `mrollback` returns the
+            // project to a checkpoint held in a git ref, so one of these
+            // destroys the way back — silently, and under `--yes` without being
+            // asked.
+            const REWRITE: [&str; 11] = [
+                "reset", "checkout", "restore", "switch", "clean", "stash", "update-ref", "rebase",
+                "filter-branch", "reflog", "gc",
+            ];
+            if REWRITE.contains(&sub) {
+                return Some(GateReason::RepositoryRewrite);
+            }
+
+            // Listing branches and tags is reading; deleting or forcing one is
+            // not.
+            const DESTRUCTIVE: [&str; 5] = ["-d", "-D", "--delete", "-f", "--force"];
+            if matches!(sub, "branch" | "tag")
+                && args.iter().any(|x| DESTRUCTIVE.contains(&x.as_str()))
+            {
+                return Some(GateReason::RepositoryRewrite);
+            }
         }
     }
 
@@ -129,44 +175,176 @@ fn floor_category(program: &str, args: &[String]) -> Option<GateReason> {
         }
     }
 
+    // A shell inside a shell needs no depth guard: the payload is one word of
+    // the arguments it was given, so every step works on strictly less text
+    // than the one before it and the walk cannot go on for ever.
+    if let Some(script) = shell_payload(&base, args) {
+        return scan_script(script);
+    }
+
     None
 }
 
-/// Lexical normalisation followed by symlink resolution of the deepest existing
-/// ancestor. `canonicalize` alone is not enough: a file being created does not
-/// exist yet, and comparing the path as written is how sandboxes are escaped.
-pub fn resolve(path: &Path, root: &Path) -> Option<PathBuf> {
-    let joined = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+/// The subcommand of a `git` invocation: the first argument that is not a flag.
+/// The few flags that take a value before the subcommand carry it away with
+/// them, so `git -C other status` is a status and not an `other`. Arguments
+/// arrive lowercased, which is why `-C` is matched as `-c`.
+fn git_subcommand(args: &[String]) -> Option<&str> {
+    const TAKES_A_VALUE: [&str; 4] = ["-c", "--git-dir", "--work-tree", "--namespace"];
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        if !a.starts_with('-') {
+            return Some(a.as_str());
+        }
+        if TAKES_A_VALUE.contains(&a.as_str()) {
+            rest.next();
+        }
+    }
+    None
+}
 
-    let mut lexical = PathBuf::new();
-    for c in joined.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !lexical.pop() {
+/// The script a shell invocation would run, if this is one.
+fn shell_payload<'a>(base: &str, args: &'a [String]) -> Option<&'a str> {
+    if !matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish") {
+        return None;
+    }
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        // `-c`, and the `-lc` / `-ic` the product itself sends: a single-dash
+        // flag carrying `c` means the next argument is the script.
+        if a.starts_with('-') && !a.starts_with("--") && a.contains('c') {
+            return rest.next().map(|s| s.as_str());
+        }
+    }
+    None
+}
+
+/// Words that stand in front of the real command without changing what it is.
+const TRANSPARENT: [&str; 8] = ["env", "command", "nohup", "time", "nice", "stdbuf", "xargs", "exec"];
+
+/// Every command in a script, judged by the same floor as a bare program.
+///
+/// Quoting is deliberately not honoured. A separator inside quotes only makes
+/// one more segment to classify, which errs towards asking a human, while
+/// honouring quotes would let `echo "; sudo rm"` hide the word from the scan.
+///
+/// This is a filter over what a model writes, not a boundary. A program name
+/// assembled at runtime cannot be read here, and a command is not confined by
+/// the operating system at all — `bash -lc` runs with the rights of whoever
+/// started the product. Hence the two shapes that cannot be read are on the
+/// floor themselves: `eval`, and a substitution standing where a program name
+/// belongs.
+fn scan_script(script: &str) -> Option<GateReason> {
+    const SEPARATORS: [char; 9] = [';', '\n', '|', '&', '(', ')', '`', '{', '}'];
+
+    for segment in script.split(SEPARATORS) {
+        let quotes = |w: &str| w.trim_matches(|c| c == '\'' || c == '"').to_string();
+        let mut words = segment
+            .split_whitespace()
+            .map(quotes)
+            .skip_while(|w| w.contains('=') || TRANSPARENT.contains(&w.to_ascii_lowercase().as_str()));
+
+        let Some(program) = words.next() else { continue };
+        let rest: Vec<String> = words.collect();
+        if let Some(reason) = floor_category(&program, &rest) {
+            return Some(reason);
+        }
+    }
+
+    if writes_a_file(script) {
+        return Some(GateReason::ShellRedirect);
+    }
+    if script.contains("$(") || script.contains('`') {
+        return Some(GateReason::OpaqueCommand);
+    }
+    None
+}
+
+/// A `>` that sends output into a file, as opposed to `2>&1`, which only moves
+/// a descriptor and is how a model asks to see both streams.
+fn writes_a_file(script: &str) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .any(|(i, c)| *c == '>' && chars.get(i + 1) != Some(&'&'))
+}
+
+/// The path the kernel will act on, for a path that may not exist yet.
+///
+/// `canonicalize` alone cannot be used — a file being created does not exist —
+/// and resolving only the deepest existing ancestor is not enough either:
+/// `Path::exists` follows a link, so a link whose target is missing looks
+/// absent, was carried through as an ordinary name, and the write then
+/// followed it out of the root (finding 24). Two rules follow, and both are
+/// the kernel's own:
+///
+///   * every component is inspected with `symlink_metadata`, and a link is
+///     replaced by its target whether or not that target exists;
+///   * `..` is applied to what the walk has resolved so far, never to the path
+///     as written — otherwise `link/..` cancels a link pointing elsewhere and
+///     lands back inside the root (finding 32).
+pub fn resolve(path: &Path, root: &Path) -> Option<PathBuf> {
+    // The kernel gives up on a chain of links rather than following it for
+    // ever; so does this, which turns a loop into `UnresolvablePath`. Spent
+    // downwards rather than compared against a limit: a counter and a
+    // comparison give a mutation that shifts the boundary by one and no test
+    // can tell, while running out of a budget has one meaning.
+    const MAX_LINK_HOPS: usize = 40;
+
+    enum Step {
+        Root(std::ffi::OsString),
+        Up,
+        Name(std::ffi::OsString),
+    }
+
+    fn push_reversed(path: &Path, pending: &mut Vec<Step>) {
+        let steps: Vec<Step> = path
+            .components()
+            .filter_map(|c| match c {
+                Component::CurDir => None,
+                Component::ParentDir => Some(Step::Up),
+                Component::RootDir | Component::Prefix(_) => Some(Step::Root(c.as_os_str().to_os_string())),
+                Component::Normal(n) => Some(Step::Name(n.to_os_string())),
+            })
+            .collect();
+        // Pushed in reverse so the walk pops them left to right, and so a
+        // link's target is walked before whatever followed the link.
+        pending.extend(steps.into_iter().rev());
+    }
+
+    let joined = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+    let mut pending: Vec<Step> = Vec::new();
+    push_reversed(&joined, &mut pending);
+
+    let mut out = PathBuf::new();
+    let mut budget = MAX_LINK_HOPS;
+
+    while let Some(step) = pending.pop() {
+        match step {
+            // An absolute link target restarts the walk, as it does for the
+            // kernel: pushing a rooted path replaces what came before it.
+            Step::Root(sep) => out.push(sep),
+            Step::Up => {
+                if !out.pop() {
                     return None;
                 }
             }
-            other => lexical.push(other.as_os_str()),
+            Step::Name(name) => {
+                let candidate = out.join(&name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(md) if md.file_type().is_symlink() => {
+                        budget = budget.checked_sub(1)?;
+                        push_reversed(&std::fs::read_link(&candidate).ok()?, &mut pending);
+                    }
+                    // Either it exists and is not a link, or it does not exist
+                    // yet: the name stands as written.
+                    _ => out = candidate,
+                }
+            }
         }
     }
 
-    // Resolve symlinks on the part that exists, keep the rest as written.
-    let mut existing = lexical.clone();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    while !existing.exists() {
-        let Some(name) = existing.file_name().map(|s| s.to_os_string()) else {
-            return Some(lexical);
-        };
-        tail.push(name);
-        if !existing.pop() {
-            return Some(lexical);
-        }
-    }
-    let mut out = existing.canonicalize().ok()?;
-    for name in tail.into_iter().rev() {
-        out.push(name);
-    }
     Some(out)
 }
 

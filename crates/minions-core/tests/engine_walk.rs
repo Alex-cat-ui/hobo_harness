@@ -52,6 +52,7 @@ fn roles() -> BTreeMap<String, RoleSpec> {
                 tools: false,
                 skill: None,
                 max_steps: None,
+                max_output: None,
                 clarifies: false,
                 must_write: false,
             },
@@ -386,5 +387,250 @@ async fn an_assistant_turn_carries_the_calls_it_made() {
         prompts[1].contains("hello from the file"),
         "and the result that came back for it:\n{}",
         prompts[1]
+    );
+}
+
+#[tokio::test]
+async fn the_run_log_says_how_big_the_prompt_was_and_of_what() {
+    // SDD §7 forbids "it will probably fit". Until T-003 the engine sent the
+    // prompt without ever counting it, so an overflow could only be guessed at
+    // from how the model behaved.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Graph {
+        nodes: vec![plain("in", NodeKind::Input), agent("a", "analyst", "01_req.md"), plain("out", NodeKind::Output)],
+        edges: vec![edge("in", "a"), edge("a", "out")],
+    };
+    let backend = ReplayBackend::new([doc("Requirements", &[("requirements", "3"), ("unknowns", "0")], "Body.")]);
+    let tok = CharRatioTokenizer::default();
+    let mut e = Engine::new(g.clone(), roles(), slots(), &backend, &tok, dir.path().to_path_buf());
+    let mut run = RunState::new("r1", "test", &g);
+
+    let mut notes = Vec::new();
+    e.run(&mut run, &mut |ev| {
+        if let Event::Note(n) = ev {
+            notes.push(n);
+        }
+    })
+    .await
+    .unwrap();
+
+    let line = notes
+        .iter()
+        .find(|n| n.starts_with("a: context "))
+        .unwrap_or_else(|| panic!("no context measurement in the log: {notes:?}"));
+
+    // The line has to carry the parts, a total and the budget it is measured
+    // against — a number with nothing to compare it to says nothing.
+    assert!(line.contains("system "), "{line}");
+    assert!(line.contains("contract "), "{line}");
+    assert!(line.contains(" tokens of a "), "{line}");
+    assert!(line.ends_with(" token budget"), "{line}");
+
+    let total: usize = line
+        .split_once("= ")
+        .and_then(|(_, t)| t.split_once(" tokens"))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or_else(|| panic!("no total in {line}"));
+    assert!(total > 0, "an empty measurement is not a measurement: {line}");
+}
+
+#[tokio::test]
+async fn a_cut_off_answer_is_named_as_one_and_the_role_says_how_much_room_it_needs() {
+    // The failure this prevents: a reply that ran out of num_predict parses as
+    // nothing, the node reports "no valid document", and the correction it
+    // sends back is advice about the format — which was never the problem.
+    let dir = tempfile::tempdir().unwrap();
+    let g = Graph {
+        nodes: vec![plain("in", NodeKind::Input), agent("a", "analyst", "01_req.md"), plain("out", NodeKind::Output)],
+        edges: vec![edge("in", "a"), edge("a", "out")],
+    };
+
+    let backend = ReplayBackend::new([
+        // What a cut-off answer looks like: the beginning of a document.
+        "CUT:---\nartifact: Requirements\nrun: x\nnode: x\nattempt: 1\nmodel: m\ncreated: c\ninputs: []\nresults:\n  requi".to_string(),
+        doc("Requirements", &[("requirements", "3"), ("unknowns", "0")], "Body."),
+    ]);
+    let tok = CharRatioTokenizer::default();
+
+    let mut roles = roles();
+    roles.get_mut("analyst").unwrap().max_output = Some(64);
+
+    let mut e = Engine::new(g.clone(), roles, slots(), &backend, &tok, dir.path().to_path_buf());
+    let mut run = RunState::new("r1", "test", &g);
+
+    let mut notes = Vec::new();
+    e.run(&mut run, &mut |ev| {
+        if let Event::Note(n) = ev {
+            notes.push(n);
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        notes.iter().any(|n| n.contains("cut off at 64 tokens")),
+        "the cut-off was not named: {notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|n| n.contains("rejected")),
+        "the model was blamed for the format instead: {notes:?}"
+    );
+    assert_eq!(run.state("a"), NodeState::Done, "the next attempt must still be allowed to succeed");
+
+    // The role's number is what was actually asked for, both times.
+    assert_eq!(backend.predicts(), vec![64, 64], "num_predict did not come from the role");
+}
+
+/// The harness measures the baseline with one command and, until T-009, kept it
+/// to itself. In the live run of 2026-08-19 the coder spent six of its fourteen
+/// steps on `python -m unittest discover tests` — exit 127 every time, on a
+/// machine that has `python3` and no `python` — while the harness held the
+/// working command the whole time (finding 37).
+#[tokio::test]
+async fn a_tool_role_is_told_the_command_the_harness_measures_with() {
+    use minions_core::dispatcher::{Dispatcher, GateAuthority, GateDecision};
+    use minions_core::journal::Journal;
+    use minions_core::sandbox::{GateReason, PermissionMode, ToolCall};
+
+    struct Approve;
+    impl GateAuthority for Approve {
+        fn ask(&self, _c: &ToolCall, _r: GateReason, _consentable: bool) -> GateDecision {
+            GateDecision::Approve
+        }
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    let run_dir = project.path().join(".minions/runs/r1");
+    let g = Graph {
+        nodes: vec![
+            plain("in", NodeKind::Input),
+            agent("worker", "worker", "01_findings.md"),
+            plain("out", NodeKind::Output),
+        ],
+        edges: vec![edge("in", "worker"), edge("worker", "out")],
+    };
+
+    let mut roles = roles();
+    let mut worker = roles.get("reviewer").cloned().unwrap();
+    worker.name = "worker".into();
+    worker.tools = true;
+    worker.max_steps = Some(4);
+    roles.insert("worker".into(), worker);
+
+    let backend = ReplayBackend::new([doc(
+        "Findings",
+        &[("breaking", "0"), ("risky", "0"), ("minor", "0"), ("unmet_requirements", "0")],
+        "Nothing to change.",
+    )]);
+    let tok = CharRatioTokenizer::default();
+    let authority = Approve;
+    let journal = Journal::create(&run_dir).unwrap();
+    let dispatcher =
+        Dispatcher::new(project.path(), PermissionMode::AskForEverything, vec![], &authority, journal).unwrap();
+
+    let mut e = Engine::new(g.clone(), roles, slots(), &backend, &tok, run_dir.clone());
+    e.dispatcher = Some(dispatcher);
+    // The shape mrun stores: the harness's own shell wrapper around the command.
+    e.test_command =
+        Some(vec!["bash".into(), "-lc".into(), "python3 -m unittest discover -s tests".into()]);
+    let mut run = RunState::new("r1", "test", &g);
+    e.run(&mut run, &mut |_| {}).await.unwrap();
+
+    let first = &backend.prompts()[0];
+    assert!(
+        first.contains("python3 -m unittest discover -s tests"),
+        "the role was never told the command the harness measures with:\n{first}"
+    );
+    assert!(
+        !first.contains("bash -lc"),
+        "the agent was shown the harness's own shell wrapper, which run_command adds itself:\n{first}"
+    );
+}
+
+/// Six identical failures in a row is how the run of 2026-08-19 burned its
+/// steps. A repeated call that failed the same way will not start working, and
+/// the harness is the only party that can see the repetition.
+#[tokio::test]
+async fn a_call_that_keeps_failing_the_same_way_is_named_out_loud() {
+    use minions_core::dispatcher::{Dispatcher, GateAuthority, GateDecision};
+    use minions_core::journal::Journal;
+    use minions_core::sandbox::{GateReason, PermissionMode, ToolCall};
+
+    struct Approve;
+    impl GateAuthority for Approve {
+        fn ask(&self, _c: &ToolCall, _r: GateReason, _consentable: bool) -> GateDecision {
+            GateDecision::Approve
+        }
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    let run_dir = project.path().join(".minions/runs/r1");
+    let g = Graph {
+        nodes: vec![
+            plain("in", NodeKind::Input),
+            agent("worker", "worker", "01_findings.md"),
+            plain("out", NodeKind::Output),
+        ],
+        edges: vec![edge("in", "worker"), edge("worker", "out")],
+    };
+
+    let mut roles = roles();
+    let mut worker = roles.get("reviewer").cloned().unwrap();
+    worker.name = "worker".into();
+    worker.tools = true;
+    worker.max_steps = Some(6);
+    roles.insert("worker".into(), worker);
+
+    // A command that is missing on every machine, so the failure is the run's
+    // own and not the operating system's mood: exit 127, three times running.
+    let wrong = "NATIVE:{\"name\":\"run_command\",\"arguments\":{\"command\":\"unittest-runner-that-does-not-exist -s tests\"}}"
+        .to_string();
+    let backend = ReplayBackend::new([
+        wrong.clone(),
+        wrong.clone(),
+        wrong.clone(),
+        doc(
+            "Findings",
+            &[("breaking", "0"), ("risky", "0"), ("minor", "0"), ("unmet_requirements", "0")],
+            "Gave up on that command.",
+        ),
+    ]);
+    let tok = CharRatioTokenizer::default();
+    let authority = Approve;
+    let journal = Journal::create(&run_dir).unwrap();
+    let dispatcher =
+        Dispatcher::new(project.path(), PermissionMode::AskForEverything, vec![], &authority, journal).unwrap();
+
+    let mut e = Engine::new(g.clone(), roles, slots(), &backend, &tok, run_dir.clone());
+    e.dispatcher = Some(dispatcher);
+    e.test_command =
+        Some(vec!["bash".into(), "-lc".into(), "python3 -m unittest discover -s tests".into()]);
+    let mut run = RunState::new("r1", "test", &g);
+
+    let mut notes = Vec::new();
+    e.run(&mut run, &mut |ev| {
+        if let Event::Note(n) = ev {
+            notes.push(n);
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(run.state("worker"), NodeState::Done);
+    let prompts = backend.prompts();
+    assert_eq!(prompts.len(), 4, "the node should have taken four steps");
+    assert!(
+        !prompts[1].contains("same call has now failed"),
+        "one failure is not a repetition:\n{}",
+        prompts[1]
+    );
+    assert!(
+        prompts[3].contains("same call has now failed 3 times"),
+        "the third identical failure was not put to the model:\n{}",
+        prompts[3]
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("same call has now failed 3 times")),
+        "and it was not said out loud in the log: {notes:?}"
     );
 }

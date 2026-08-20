@@ -87,16 +87,28 @@ impl ModelBackend for Ollama {
 pub struct ReplayBackend {
     replies: Mutex<VecDeque<String>>,
     seen: Mutex<Vec<String>>,
+    /// `num_predict` of each request, so a test can check what room the engine
+    /// actually asked for rather than infer it from what it said.
+    predicts: Mutex<Vec<i32>>,
 }
 
 impl ReplayBackend {
     pub fn new(replies: impl IntoIterator<Item = String>) -> Self {
-        Self { replies: Mutex::new(replies.into_iter().collect()), seen: Mutex::new(Vec::new()) }
+        Self {
+            replies: Mutex::new(replies.into_iter().collect()),
+            seen: Mutex::new(Vec::new()),
+            predicts: Mutex::new(Vec::new()),
+        }
     }
 
     /// Prompts the engine actually sent, for asserting on context assembly.
     pub fn prompts(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// The room asked for on each request, in order.
+    pub fn predicts(&self) -> Vec<i32> {
+        self.predicts.lock().unwrap().clone()
     }
 
     pub fn remaining(&self) -> usize {
@@ -113,10 +125,11 @@ impl ModelBackend for ReplayBackend {
         _model: &str,
         messages: &[Message],
         _tools: Vec<serde_json::Value>,
-        _opts: &Options,
+        opts: &Options,
         _keep_alive: &str,
         on_token: &mut dyn TokenSink,
     ) -> Result<ChatReply> {
+        self.predicts.lock().unwrap().push(opts.num_predict);
         let rendered = messages
             .iter()
             .map(|m| {
@@ -137,15 +150,16 @@ impl ModelBackend for ReplayBackend {
             .unwrap()
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("the replay backend ran out of scripted replies"))?;
+        let (reply, truncated) = cut_off(reply);
         for chunk in reply.as_bytes().chunks(64) {
             on_token.token(&String::from_utf8_lossy(chunk));
         }
         match reply.strip_prefix("NATIVE:") {
             Some(body) => {
                 let tool_calls = crate::chat::recover_from_text(body);
-                Ok(ChatReply { text: String::new(), tool_calls, prompt_tokens: 0, eval_tokens: 0 })
+                Ok(ChatReply { text: String::new(), tool_calls, prompt_tokens: 0, eval_tokens: 0, truncated })
             }
-            None => Ok(ChatReply { text: reply, tool_calls: Vec::new(), prompt_tokens: 0, eval_tokens: 0 }),
+            None => Ok(ChatReply { text: reply, tool_calls: Vec::new(), prompt_tokens: 0, eval_tokens: 0, truncated }),
         }
     }
 
@@ -153,10 +167,11 @@ impl ModelBackend for ReplayBackend {
         &self,
         _model: &str,
         prompt: &str,
-        _opts: &Options,
+        opts: &Options,
         _keep_alive: &str,
         on_token: &mut dyn TokenSink,
     ) -> Result<Completion> {
+        self.predicts.lock().unwrap().push(opts.num_predict);
         self.seen.lock().unwrap().push(prompt.to_string());
         let reply = self
             .replies
@@ -164,10 +179,23 @@ impl ModelBackend for ReplayBackend {
             .unwrap()
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("the replay backend ran out of scripted replies"))?;
+        let (reply, truncated) = cut_off(reply);
         // Streamed in pieces so callers exercise the same path as a live model.
         for chunk in reply.as_bytes().chunks(64) {
             on_token.token(&String::from_utf8_lossy(chunk));
         }
-        Ok(Completion { text: reply, prompt_tokens: 0, eval_tokens: 0 })
+        Ok(Completion { text: reply, prompt_tokens: 0, eval_tokens: 0, truncated })
+    }
+}
+
+/// A scripted reply prefixed with `CUT:` comes back the way a reply that ran
+/// out of `num_predict` does: the text it managed to produce, and the fact that
+/// it stopped early. Scriptable for the same reason `NATIVE:` is — a run cut
+/// off mid-answer is a real thing the engine has to tell apart from a model
+/// that wrote nonsense.
+fn cut_off(reply: String) -> (String, bool) {
+    match reply.strip_prefix("CUT:") {
+        Some(rest) => (rest.to_string(), true),
+        None => (reply, false),
     }
 }

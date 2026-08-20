@@ -7,16 +7,33 @@ and reversible in one step from a checkpoint taken before the first write.
 
 Rust workspace, no cloud — models are whatever Ollama has locally.
 
-## Status: early, and the sandbox does not yet hold
+## Status: early — the sandbox filters, it does not confine
 
-Known and unfixed as of 2026-08-19, both proven by execution, both being fixed:
+Both holes listed here on 2026-08-19 are closed, and each was proven closed the
+way it was found — by execution:
 
-- commands issued by an agent bypass the permission floor — every one of them is
-  wrapped in `bash -lc`, and the floor only looks at the program name;
-- a write can leave the project root through a dangling symlink.
+- the floor reads the shell script an agent asks to run, so deletion, network
+  fetches, package installs, redirection into a file and repository rewrites
+  reach it. They used to arrive as the word `bash` and pass as ordinary work;
+- a path is resolved component by component, so a write cannot leave the project
+  root through a symlink, dangling or otherwise.
 
-**Do not run this against anything you care about, and do not use `--yes`
-outside a throwaway directory.**
+What is still true, and worth knowing before pointing this at anything:
+
+- it is a filter over what a model writes, not a boundary. The operating system
+  does not confine the command — the shell runs with your rights, and a program
+  name assembled at runtime cannot be read;
+- `.minions/` — the run's journal and the checkpoint it is rolled back to —
+  lives inside the project and is writable by the agent;
+- a refused call is not journalled, so the record says what was done and not
+  what was declined.
+
+As of 2026-08-20 a development workflow produced a working change for the first
+time: on a toy project, one function and one test, the suite green and nothing
+lost. The reviewer that passed it reported a defect that does not reproduce and
+missed one that does.
+
+**Prefer a throwaway directory, and read the above before using `--yes`.**
 
 ## Running
 
